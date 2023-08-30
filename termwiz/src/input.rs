@@ -638,11 +638,34 @@ enum InputState {
     Pasting(usize),
 }
 
-#[derive(Debug)]
+trait InputMatcher {
+    fn is_match(&mut self, event: &InputEvent) -> bool;
+}
+
+impl<F: FnMut(&InputEvent) -> bool> InputMatcher for F {
+    fn is_match(&mut self, event: &InputEvent) -> bool {
+        self(event)
+    }
+}
+
 pub struct InputParser {
     key_map: KeyMap<InputEvent>,
     buf: ReadBuffer,
     state: InputState,
+    unmatched_input: Vec<u8>,
+    input_matcher: Box<dyn InputMatcher>,
+}
+
+impl std::fmt::Debug for InputParser {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("InputParser")
+            .field("key_map", &self.key_map)
+            .field("buf", &self.buf)
+            .field("state", &self.state)
+            .field("unmatched_input", &self.unmatched_input)
+            .field("input_matcher", &"Input Matcher")
+            .finish()
+    }
 }
 
 #[cfg(windows)]
@@ -898,7 +921,19 @@ impl InputParser {
             key_map: Self::build_basic_key_map(),
             buf: ReadBuffer::new(),
             state: InputState::Normal,
+            unmatched_input: Vec::<u8>::new(),
+            input_matcher: Box::new(|_: &_| true),
         }
+    }
+
+    pub fn new_in_filter_mode<F: FnMut(&InputEvent) -> bool + 'static>(input_matcher: F) -> Self {
+        let mut this = Self::new();
+        this.input_matcher = Box::new(input_matcher);
+        this
+    }
+
+    pub fn take_unmatched_input(&mut self) -> Vec<u8> {
+        std::mem::take(&mut self.unmatched_input)
     }
 
     fn build_basic_key_map() -> KeyMap<InputEvent> {
@@ -1278,8 +1313,12 @@ impl InputParser {
         }
     }
 
-    fn dispatch_callback<F: FnMut(InputEvent)>(&mut self, mut callback: F, event: InputEvent) {
-        match (self.state, event) {
+    fn dispatch_callback<F: FnMut(InputEvent)>(
+        &mut self,
+        mut callback: F,
+        event: InputEvent,
+    ) -> bool {
+        return match (self.state, event) {
             (
                 InputState::Normal,
                 InputEvent::Key(KeyEvent {
@@ -1288,6 +1327,7 @@ impl InputParser {
                 }),
             ) => {
                 self.state = InputState::Pasting(0);
+                false
             }
             (
                 InputState::EscapeMaybeAlt,
@@ -1298,31 +1338,63 @@ impl InputParser {
             ) => {
                 // The prior ESC was not part of an ALT sequence, so emit
                 // it before we start collecting for paste.
-                callback(InputEvent::Key(KeyEvent {
-                    key: KeyCode::Escape,
-                    modifiers: Modifiers::NONE,
-                }));
                 self.state = InputState::Pasting(0);
+                let matched = self.dispatch_callback_if_matches(
+                    &mut callback,
+                    InputEvent::Key(KeyEvent {
+                        key: KeyCode::Escape,
+                        modifiers: Modifiers::NONE,
+                    }),
+                );
+                if !matched {
+                    self.unmatched_input.push(b'\x1b');
+                }
+                matched
             }
             (InputState::EscapeMaybeAlt, InputEvent::Key(KeyEvent { key, modifiers })) => {
                 // Treat this as ALT-key
                 self.state = InputState::Normal;
-                callback(InputEvent::Key(KeyEvent {
-                    key,
-                    modifiers: modifiers | Modifiers::ALT,
-                }));
+                let matched = self.dispatch_callback_if_matches(
+                    &mut callback,
+                    InputEvent::Key(KeyEvent {
+                        key,
+                        modifiers: modifiers | Modifiers::ALT,
+                    }),
+                );
+                if !matched {
+                    self.unmatched_input.push(b'\x1b');
+                }
+                matched
             }
             (InputState::EscapeMaybeAlt, event) => {
                 // The prior ESC was not part of an ALT sequence, so emit
                 // both it and the current event
-                callback(InputEvent::Key(KeyEvent {
-                    key: KeyCode::Escape,
-                    modifiers: Modifiers::NONE,
-                }));
-                callback(event);
+                let matched = self.dispatch_callback_if_matches(
+                    &mut callback,
+                    InputEvent::Key(KeyEvent {
+                        key: KeyCode::Escape,
+                        modifiers: Modifiers::NONE,
+                    }),
+                );
+                if !matched {
+                    self.unmatched_input.push(b'\x1b');
+                }
+                self.dispatch_callback_if_matches(&mut callback, event)
             }
-            (_, event) => callback(event),
+            (_, event) => self.dispatch_callback_if_matches(&mut callback, event),
+        };
+    }
+
+    fn dispatch_callback_if_matches<F: FnMut(InputEvent)>(
+        &mut self,
+        callback: &mut F,
+        event: InputEvent,
+    ) -> bool {
+        if self.input_matcher.is_match(&event) {
+            callback(event);
+            return true;
         }
+        false
     }
 
     fn process_bytes<F: FnMut(InputEvent)>(&mut self, mut callback: F, maybe_more: bool) {
@@ -1333,8 +1405,14 @@ impl InputParser {
                     if let Some(idx) = self.buf.find_subsequence(offset, end_paste) {
                         let pasted =
                             String::from_utf8_lossy(&self.buf.as_slice()[0..idx]).to_string();
-                        self.buf.advance(pasted.len() + end_paste.len());
-                        callback(InputEvent::Paste(pasted));
+                        let len = pasted.len() + end_paste.len();
+                        if !self
+                            .dispatch_callback_if_matches(&mut callback, InputEvent::Paste(pasted))
+                        {
+                            self.unmatched_input
+                                .extend_from_slice(&self.buf.as_slice()[..len]);
+                        }
+                        self.buf.advance(len);
                         self.state = InputState::Normal;
                     } else {
                         // Advance our offset so that in the case where we receive a paste that
@@ -1358,36 +1436,41 @@ impl InputParser {
                         if let Some((Action::CSI(CSI::Mouse(mouse)), len)) =
                             parser.parse_first(self.buf.as_slice())
                         {
-                            self.buf.advance(len);
-
-                            match mouse {
+                            let matched = match mouse {
                                 MouseReport::SGR1006 {
                                     x,
                                     y,
                                     button,
                                     modifiers,
-                                } => {
-                                    callback(InputEvent::Mouse(MouseEvent {
+                                } => self.dispatch_callback_if_matches(
+                                    &mut callback,
+                                    InputEvent::Mouse(MouseEvent {
                                         x,
                                         y,
                                         mouse_buttons: button.into(),
                                         modifiers,
-                                    }));
-                                }
+                                    }),
+                                ),
                                 MouseReport::SGR1016 {
                                     x_pixels,
                                     y_pixels,
                                     button,
                                     modifiers,
-                                } => {
-                                    callback(InputEvent::PixelMouse(PixelMouseEvent {
+                                } => self.dispatch_callback_if_matches(
+                                    &mut callback,
+                                    InputEvent::PixelMouse(PixelMouseEvent {
                                         x_pixels: x_pixels,
                                         y_pixels: y_pixels,
                                         mouse_buttons: button.into(),
                                         modifiers,
-                                    }));
-                                }
+                                    }),
+                                ),
+                            };
+                            if !matched {
+                                self.unmatched_input
+                                    .extend_from_slice(&self.buf.as_slice()[..len]);
                             }
+                            self.buf.advance(len);
                             continue;
                         }
                     }
@@ -1412,10 +1495,15 @@ impl InputParser {
                             _,
                         ) if self.state == InputState::Normal && self.buf.len() > len => {
                             self.state = InputState::EscapeMaybeAlt;
+                            // We'll put escape into unmatched_input later, if needed.
                             self.buf.advance(len);
                         }
                         (Found::Exact(len, event), _) | (Found::Ambiguous(len, event), false) => {
-                            self.dispatch_callback(&mut callback, event.clone());
+                            let matched = self.dispatch_callback(&mut callback, event.clone());
+                            if !matched {
+                                self.unmatched_input
+                                    .extend_from_slice(&self.buf.as_slice()[..len]);
+                            }
                             self.buf.advance(len);
                         }
                         (Found::Ambiguous(_, _), true) | (Found::NeedData, true) => {
@@ -1424,14 +1512,18 @@ impl InputParser {
                         (Found::None, _) | (Found::NeedData, false) => {
                             // No pre-defined key, so pull out a unicode character
                             if let Some((c, len)) = Self::decode_one_char(self.buf.as_slice()) {
-                                self.buf.advance(len);
-                                self.dispatch_callback(
+                                let matched = self.dispatch_callback(
                                     &mut callback,
                                     InputEvent::Key(KeyEvent {
                                         key: KeyCode::Char(c),
                                         modifiers: Modifiers::NONE,
                                     }),
                                 );
+                                if !matched {
+                                    self.unmatched_input
+                                        .extend_from_slice(&self.buf.as_slice()[..len]);
+                                }
+                                self.buf.advance(len);
                             } else {
                                 // We need more data to recognize the input, so
                                 // yield the remainder of the slice
