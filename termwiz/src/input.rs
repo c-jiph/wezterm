@@ -926,7 +926,7 @@ impl InputParser {
         }
     }
 
-    pub fn new_in_filter_mode<F: FnMut(&InputEvent) -> bool + 'static>(input_matcher: F) -> Self {
+    pub fn new_in_filter_mode<F: Fn(&InputEvent) -> bool + 'static>(input_matcher: F) -> Self {
         let mut this = Self::new();
         this.input_matcher = Box::new(input_matcher);
         this
