@@ -581,6 +581,10 @@ impl TerminalState {
         }
     }
 
+    pub fn current_modify_other_keys(&self) -> Option<i64> {
+        self.modify_other_keys
+    }
+
     pub fn enable_conpty_quirks(&mut self) {
         self.enable_conpty_quirks = true;
         self.suppress_initial_title_change = true;
